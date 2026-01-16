@@ -1,6 +1,7 @@
 # 大文件 - 数据库文件
 *.db
-
+*.txt
+*.mp4
 # Python
 __pycache__/
 *.py[cod]
