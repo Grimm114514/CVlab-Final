@@ -2,30 +2,29 @@ import os
 import numpy as np
 import cv2
 from tqdm import tqdm
+import shutil
 
+# 配置参数
 CONFIG = {
-    # COLMAP 导出的 txt 文件夹路径
-    "colmap_text_dir": "./models/origin_2",
+    "colmap_text_dir": "./models/col4",  # COLMAP 模型目录
+    "mask_dir": "./Masks/Mask4",  # DeepLab Mask 目录
+    "output_dir": "./models/final_semantic_model4",  # 输出目录
     
-    # DeepLab 生成的 Mask 文件夹路径
-    "mask_dir": "./Masks/Mask2",
-    
-    # 输出的新模型保存路径
-    "output_dir": "./models/sparse_semantic_2",
-    
-    # 颜色映射 (R, G, B)
+    # 语义类别颜色映射
     "color_map": {
-        2:  [255, 0, 0],    # 建筑 -> 红色
-        8:  [0, 255, 0],    # 植被 -> 绿色
-        0:  [128, 128, 128],# 道路 -> 灰色
-        1:  [128, 128, 128],# 人行道 -> 灰色
+        0:  [128, 128, 128],  # Road
+        1:  [128, 128, 128],  # Sidewalk
+        2:  [128, 0, 0],      # Building
+        3:  [128, 64, 128],   # Wall
+        4:  [128, 128, 0],    # Fence
+        8:  [0, 128, 0],      # Vegetation
+        9:  [0, 255, 0],      # Terrain
     },
     
-    # 默认颜色 (黑色)
-    "default_color": [0, 0, 0]
+    "default_color": [0, 0, 0]  # 未识别点默认颜色
 }
 
-class Image:
+class ImageObj:
     def __init__(self, id, name, xys, point3D_ids):
         self.id = id
         self.name = name
@@ -42,7 +41,12 @@ class Point3D:
         self.point2D_idxs = point2D_idxs
 
 def read_images_text(path):
+    """读取 images.txt"""
     images = {}
+    if not os.path.exists(path):
+        print(f"错误: 文件不存在 {path}")
+        return images
+        
     with open(path, "r") as fid:
         while True:
             line = fid.readline()
@@ -51,20 +55,24 @@ def read_images_text(path):
             if len(line) > 0 and line[0] != "#":
                 elems = line.split()
                 image_id = int(elems[0])
-                image_name = elems[-1] # 文件名
+                image_name = elems[-1] 
                 
-                # 读取下一行 (Points2D)
                 line = fid.readline()
                 elems = line.split()
                 points2D = np.array(elems).reshape(-1, 3)
                 xys = points2D[:, :2].astype(float)
                 point3D_ids = points2D[:, 2].astype(int)
                 
-                images[image_id] = Image(image_id, image_name, xys, point3D_ids)
+                images[image_id] = ImageObj(image_id, image_name, xys, point3D_ids)
     return images
 
 def read_points3D_text(path):
+    """读取 points3D.txt"""
     points3D = {}
+    if not os.path.exists(path):
+        print(f"错误: 文件不存在 {path}")
+        return points3D
+
     with open(path, "r") as fid:
         while True:
             line = fid.readline()
@@ -83,6 +91,8 @@ def read_points3D_text(path):
     return points3D
 
 def write_points3D_text(points3D, path):
+    """写入 points3D.txt"""
+    print(f"保存点云: {path}")
     with open(path, "w") as fid:
         fid.write("# 3D point list with one line of data per point:\n")
         fid.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
@@ -94,18 +104,24 @@ def write_points3D_text(points3D, path):
                       f"{point.rgb[0]} {point.rgb[1]} {point.rgb[2]} {point.error}{track_str}\n")
 
 def main():
-    print("开始语义融合...")
+    print("开始语义点云融合")
     
-    # 读取 COLMAP 数据
-    print(f"正在读取 COLMAP 模型: {CONFIG['colmap_text_dir']}")
+    # 读取 COLMAP 模型
+    print(f"读取模型: {CONFIG['colmap_text_dir']}")
     images_map = read_images_text(os.path.join(CONFIG['colmap_text_dir'], "images.txt"))
     points3D_map = read_points3D_text(os.path.join(CONFIG['colmap_text_dir'], "points3D.txt"))
-    print(f"   -> 加载了 {len(images_map)} 张位姿图像")
-    print(f"   -> 加载了 {len(points3D_map)} 个稀疏 3D 点")
+    
+    if len(images_map) == 0 or len(points3D_map) == 0:
+        print("错误: 模型数据加载失败")
+        return
 
-    # 预加载所有 Masks
-    print("正在预加载 Mask 图片...")
+    print(f"图像数: {len(images_map)}")
+    print(f"点云数: {len(points3D_map)}")
+
+    # 预加载 Masks
+    print("加载 Masks...")
     masks_cache = {}
+    loaded_count = 0
     
     for img_id, img_obj in tqdm(images_map.items()):
         base_name = os.path.splitext(img_obj.name)[0]
@@ -115,38 +131,35 @@ def main():
         if os.path.exists(mask_path):
             mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
             masks_cache[img_id] = mask
-        else:
-            pass
+            loaded_count += 1
+    
+    print(f"-> 成功加载 {loaded_count} 张 Mask")
 
-    print(f"   -> 成功缓存了 {len(masks_cache)} 张 Mask")
-    if len(masks_cache) == 0:
-        print("错误: 一张 Mask 也没读到，请检查文件名和路径配置！")
-        return
-
-    # 遍历 3D 点进行语义投票
-    print("正在为 3D 点上色 (Voting)...")
+    # 语义投票上色
+    print("开始为 3D 点进行语义投票...")
     
     modified_count = 0
+    
     for point_id, point in tqdm(points3D_map.items()):
         votes = []
         
         for i in range(len(point.image_ids)):
             img_id = point.image_ids[i]
-            point2d_idx = point.point2D_idxs[i]
             
             if img_id in masks_cache:
                 img_obj = images_map[img_id]
                 mask = masks_cache[img_id]
                 
-                x, y = img_obj.xys[point2d_idx]
-                x, y = int(x), int(y)
+                point2d_idx = point.point2D_idxs[i]
+                u, v = img_obj.xys[point2d_idx]
+                u, v = int(u), int(v)
                 
                 h, w = mask.shape
-                if 0 <= y < h and 0 <= x < w:
-                    label_id = mask[y, x]
+                if 0 <= v < h and 0 <= u < w:
+                    label_id = mask[v, u]
                     votes.append(label_id)
         
-        # 决定颜色
+        # 投票决定颜色
         final_color = CONFIG["default_color"]
         
         if votes:
@@ -166,15 +179,15 @@ def main():
     # 保存结果
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
     out_path = os.path.join(CONFIG["output_dir"], "points3D.txt")
-    print(f"正在保存结果到: {out_path}")
     write_points3D_text(points3D_map, out_path)
     
-    # 复制 images.txt 和 cameras.txt
-    import shutil
-    shutil.copy(os.path.join(CONFIG['colmap_text_dir'], "cameras.txt"), CONFIG["output_dir"])
-    shutil.copy(os.path.join(CONFIG['colmap_text_dir'], "images.txt"), CONFIG["output_dir"])
+    # 复制其他文件(src_img, CONFIG["output_dir"])
     
-    print("全部完成！")
-
+    print("复制相机参数文件...")
+    src_cam = os.path.join(CONFIG['colmap_text_dir'], "cameras.txt")
+    src_img = os.path.join(CONFIG['colmap_text_dir'], "images.txt")
+    if os.path.exists(src_cam): shutil.copy(src_cam, CONFIG["output_dir"])
+    if os.path.exists(src_img): shutil.copy
+    print(f"结果已保存在: {CONFIG['output_dir']}")
 if __name__ == "__main__":
     main()
